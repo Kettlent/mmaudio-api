@@ -10,163 +10,151 @@ import torchaudio
 import anyio
 
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-#uvicorn server:app --host 0.0.0.0 --port 8080
-
-# MMAudio imports (same as demo.py)
+# MMAudio imports
 from mmaudio.eval_utils import (
-    ModelConfig, all_model_cfg, generate,
-    load_video, make_video, setup_eval_logging
+    ModelConfig,
+    all_model_cfg,
+    generate,
+    load_video,
+    make_video,
+    setup_eval_logging
 )
 from mmaudio.model.flow_matching import FlowMatching
 from mmaudio.model.networks import MMAudio, get_my_mmaudio
 from mmaudio.model.utils.features_utils import FeaturesUtils
-from starlette.background import BackgroundTask
 
-# ----------------------------------------------------
-# Basic Setup
-# ----------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("mmaudio-fastapi")
 
+# -------------------------------------------------------------
+# FASTAPI INIT
+# -------------------------------------------------------------
 app = FastAPI(title="MMAudio FastAPI")
+log = logging.getLogger("mmaudio-fastapi")
+logging.basicConfig(level=logging.INFO)
 
-VARIANT = "large_44k_v2"    # change if needed
+# -------------------------------------------------------------
+# GLOBAL CONFIG
+# -------------------------------------------------------------
+VARIANT = "large_44k_v2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
-
-# ----------------------------------------------------
-# Global model objects (filled at startup)
-# ----------------------------------------------------
-model_cfg: ModelConfig | None = None
+model_cfg = None
 seq_cfg = None
-net: MMAudio | None = None
-feature_utils: FeaturesUtils | None = None
+net = None
+feature_utils = None
 
 
-# ----------------------------------------------------
-# Load Model Once on Startup
-# ----------------------------------------------------
+# -------------------------------------------------------------
+# UTIL
+# -------------------------------------------------------------
+def run_blocking(fn, *args, **kwargs):
+    """Run blocking function in a worker thread."""
+    return anyio.to_thread.run_sync(lambda: fn(*args, **kwargs))
+
+
+def safe_tensor(x):
+    """Clone, detach, contiguous, move to device and dtype."""
+    if x is None:
+        return None
+    return (
+        x.clone()
+         .detach()
+         .contiguous()
+         .to(device=DEVICE, dtype=DTYPE)
+    )
+
+
+# -------------------------------------------------------------
+# STARTUP — Load Model Once
+# -------------------------------------------------------------
 @app.on_event("startup")
 def load_model():
     global model_cfg, seq_cfg, net, feature_utils
 
     setup_eval_logging()
-
-    log.info(f"Loading MMAudio variant: {VARIANT}")
-    if VARIANT not in all_model_cfg:
-        raise RuntimeError(f"Unknown model variant: {VARIANT}")
+    log.info(f"[INIT] Loading MMAudio variant: {VARIANT}")
 
     model_cfg = all_model_cfg[VARIANT]
     model_cfg.download_if_needed()
     seq_cfg = model_cfg.seq_cfg
 
-    log.info(f"Device = {DEVICE}, dtype = {DTYPE}")
+    log.info(f"[INIT] Device: {DEVICE}, dtype: {DTYPE}")
 
-    # Load network
+    # Load main model
     net = get_my_mmaudio(model_cfg.model_name).to(DEVICE, DTYPE).eval()
     weights = torch.load(model_cfg.model_path, map_location=DEVICE, weights_only=True)
     net.load_weights(weights)
-    log.info(f"Model weights loaded: {model_cfg.model_path}")
+    log.info("[INIT] Loaded model weights")
 
-    # Load feature utils (VAE, synchformer, vocoder)
+    # Load feature utils
     feature_utils = FeaturesUtils(
         tod_vae_ckpt=model_cfg.vae_path,
         synchformer_ckpt=model_cfg.synchformer_ckpt,
         enable_conditions=True,
         mode=model_cfg.mode,
         bigvgan_vocoder_ckpt=model_cfg.bigvgan_16k_path,
-        need_vae_encoder=False,
+        need_vae_encoder=False
     ).to(DEVICE, DTYPE).eval()
 
-    log.info("Feature utils loaded successfully")
-    log.info("MMAudio is ready!")
+    log.info("[INIT] Feature utils ready")
 
 
-# ----------------------------------------------------
-# Run blocking function safely in thread
-# ----------------------------------------------------
-def run_blocking(fn, *args, **kwargs):
-    return anyio.to_thread.run_sync(lambda: fn(*args, **kwargs))
-
-
-# ----------------------------------------------------
-# /generate_audio — text → audio
-# ----------------------------------------------------
+# -------------------------------------------------------------
+# GENERATE AUDIO ONLY
+# -------------------------------------------------------------
 @app.post("/generate_audio")
 async def generate_audio(
     prompt: str = Form(...),
     negative_prompt: str = Form(""),
     duration: float = Form(8.0),
     cfg_strength: float = Form(4.5),
-    num_steps: int = Form(25)
+    num_steps: int = Form(25),
 ):
-    """
-    Generate FLAC audio from a text prompt using MMAudio.
-    """
     try:
-        # Build FlowMatching
-        rng = torch.Generator(device=DEVICE)
-        rng.manual_seed(42)
+        rng = torch.Generator(device=DEVICE).manual_seed(42)
         fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=num_steps)
 
-        # Update sequence length for requested duration
         seq_cfg.duration = duration
-        net.update_seq_lengths(
-            seq_cfg.latent_seq_len,
-            seq_cfg.clip_seq_len,
-            seq_cfg.sync_seq_len
-        )
+        net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
 
-        # Blocking generation (run in thread)
         def gen_fn():
-            audios = generate(
-                clip_frames=None,
-                sync_frames=None,
-                text=[prompt],
-                negative_text=[negative_prompt],
-                feature_utils=feature_utils,
-                net=net,
-                fm=fm,
-                rng=rng,
-                cfg_strength=cfg_strength
-            )
-            return audios.float().cpu()[0]
+            with torch.no_grad():
+                audio = generate(
+                    None,
+                    None,
+                    [prompt],
+                    negative_text=[negative_prompt],
+                    feature_utils=feature_utils,
+                    net=net,
+                    fm=fm,
+                    rng=rng,
+                    cfg_strength=cfg_strength
+                ).float().cpu()[0]
+            return audio
 
         audio = await run_blocking(gen_fn)
 
-        # Convert audio → FLAC in memory
-        buffer = io.BytesIO()
-        torchaudio.save(buffer, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
-        buffer.seek(0)
-
-        # Save buffer to a temporary FLAC file
-        filename = f"mmaudio_{abs(hash(prompt))}.flac"
+        # Save to temp flac
         temp_path = tempfile.NamedTemporaryFile(delete=False, suffix=".flac").name
+        torchaudio.save(temp_path, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
 
-        with open(temp_path, "wb") as f:
-             f.write(buffer.getvalue())
-
-# Return full FLAC file
         return FileResponse(
-                 path=temp_path,
-                 media_type="audio/flac",
-                 filename=filename,
-                 background=BackgroundTask(lambda: os.remove(temp_path))
-)
-
+            temp_path,
+            media_type="audio/flac",
+            filename="mmaudio_output.flac",
+            background=None
+        )
 
     except Exception as e:
-        log.exception("Error in /generate_audio")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.exception("Error in generate_audio")
+        raise HTTPException(500, str(e))
 
 
-# ----------------------------------------------------
-# /generate_video — video + text → new video with generated audio
-# ----------------------------------------------------
+# -------------------------------------------------------------
+# GENERATE VIDEO (video → new video with generated audio)
+# -------------------------------------------------------------
 @app.post("/generate_video")
 async def generate_video(
     video: UploadFile = File(...),
@@ -176,117 +164,93 @@ async def generate_video(
     cfg_strength: float = Form(4.5),
     num_steps: int = Form(25),
 ):
-    """
-    Debug version: logs everything, saves all intermediate files.
-    """
-
     DEBUG_DIR = Path("/workspace/mmaudio-debug")
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-    uploaded_path = None
-
     try:
-        # -------------------------------------------
-        # Save uploaded video for inspection
-        # -------------------------------------------
-        uploaded_filename = f"uploaded_{video.filename}"
-        uploaded_path = DEBUG_DIR / uploaded_filename
-
+        # -------------------------------------------------
+        # Save upload
+        # -------------------------------------------------
+        uploaded_path = DEBUG_DIR / f"uploaded_{video.filename}"
         with open(uploaded_path, "wb") as f:
             f.write(await video.read())
 
-        log.info(f"[DEBUG] Uploaded video saved → {uploaded_path}")
-        log.info(f"[DEBUG] File size = {uploaded_path.stat().st_size} bytes")
+        log.info(f"[DEBUG] Saved upload → {uploaded_path} ({uploaded_path.stat().st_size} bytes)")
 
-        if uploaded_path.stat().st_size < 1000:
-            log.error("[ERROR] Uploaded video is too small — probably corrupted upload")
-            raise HTTPException(400, "Uploaded video invalid")
+        if uploaded_path.stat().st_size < 2000:
+            raise HTTPException(400, "Uploaded video too small or corrupted")
 
-        # -------------------------------------------
-        # Start generation
-        # -------------------------------------------
+        # -------------------------------------------------
+        # Heavy generation in a worker thread
+        # -------------------------------------------------
         def gen_video_fn():
-    # RNG and sampler
-            rng = torch.Generator(device=DEVICE)
-            rng.manual_seed(42)
+
+            rng = torch.Generator(device=DEVICE).manual_seed(42)
             fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=num_steps)
 
-            # load video_info (same as before)
+            # Load video
             video_info = load_video(uploaded_path, duration)
 
-            log.info(f"[DEBUG] video_info.duration_sec = {video_info.duration_sec}")
-            log.info(f"[DEBUG] clip_frames raw shape = {None if video_info.clip_frames is None else video_info.clip_frames.shape}")
-            log.info(f"[DEBUG] sync_frames raw shape = {None if video_info.sync_frames is None else video_info.sync_frames.shape}")
+            clip = video_info.clip_frames
+            sync = video_info.sync_frames
 
-            # Prepare clip_frames / sync_frames for the model:
-            # - move to DEVICE
-            # - clone() to get an owning tensor (break views)
-            # - detach() to ensure not attached to autograd graph
-            # - contiguous() so linear layers like it
-            if video_info.clip_frames is not None:
-                clip_frames = video_info.clip_frames.unsqueeze(0)  # (1, VN, C, H, W)
-                clip_frames = clip_frames.to(device=DEVICE)
-                clip_frames = clip_frames.clone().detach().contiguous()
-            else:
-                clip_frames = None
+            log.info(f"[DEBUG] clip shape = {None if clip is None else clip.shape}")
+            log.info(f"[DEBUG] sync shape = {None if sync is None else sync.shape}")
 
-            if video_info.sync_frames is not None:
-                sync_frames = video_info.sync_frames.unsqueeze(0)  # (1, S, C, H, W)
-                sync_frames = sync_frames.to(device=DEVICE)
-                sync_frames = sync_frames.clone().detach().contiguous()
-            else:
-                sync_frames = None
+            # Prepare frames
+            clip_frames = safe_tensor(clip.unsqueeze(0)) if clip is not None else None
+            sync_frames = safe_tensor(sync.unsqueeze(0)) if sync is not None else None
 
-    # update seq length (as before)
-                seq_cfg.duration = video_info.duration_sec
-                net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
+            # Update sequence lengths
+            seq_cfg.duration = video_info.duration_sec
+            net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
 
-                # Run generate() under inference mode (disables autograd and is faster)
-                with torch.inference_mode():
-                    audios = generate(
-                        clip_frames,
-                        sync_frames,
-                        [prompt],
-                        negative_text=[negative_prompt],
-                        feature_utils=feature_utils,
-                        net=net,
-                        fm=fm,
-                        rng=rng,
-                        cfg_strength=cfg_strength,
-                    )
-                    audio = audios.float().cpu()[0]
+            with torch.no_grad():
+                audios = generate(
+                    clip_frames,
+                    sync_frames,
+                    [prompt],
+                    negative_text=[negative_prompt],
+                    feature_utils=feature_utils,
+                    net=net,
+                    fm=fm,
+                    rng=rng,
+                    cfg_strength=cfg_strength
+                )
+                audio = audios.float().cpu()[0]
 
-                # Save debug audio and final video as before
-                raw_audio_path = DEBUG_DIR / f"generated_audio_{abs(hash(prompt))}.flac"
-                torchaudio.save(raw_audio_path, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
-                log.info(f"[DEBUG] Generated audio saved → {raw_audio_path} ({raw_audio_path.stat().st_size} bytes)")
+            # Save audio debug
+            audio_path = DEBUG_DIR / "generated_audio.flac"
+            torchaudio.save(audio_path, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
+            log.info(f"[DEBUG] Saved audio → {audio_path} ({audio_path.stat().st_size} bytes)")
 
-                saved_video_path = DEBUG_DIR / f"final_output_{abs(hash(prompt))}.mp4"
-                make_video(video_info, saved_video_path, audio, sampling_rate=seq_cfg.sampling_rate)
-                log.info(f"[DEBUG] Final video saved → {saved_video_path} ({saved_video_path.stat().st_size} bytes)")
+            # Save final video
+            output_path = DEBUG_DIR / "final_output.mp4"
+            make_video(video_info, output_path, audio, sampling_rate=seq_cfg.sampling_rate)
+            log.info(f"[DEBUG] Saved final video → {output_path} ({output_path.stat().st_size} bytes)")
 
-                return saved_video_path
+            return output_path
 
-        final_video_path = await run_blocking(gen_video_fn)
+        # Run generation
+        final_path = await run_blocking(gen_video_fn)
 
-        # -------------------------------------------
-        # Return final file
-        # -------------------------------------------
+        if final_path is None or not final_path.exists():
+            raise HTTPException(500, "Video generation failed")
+
+        # -------------------------------------------------
+        # Return completed MP4
+        # -------------------------------------------------
         return FileResponse(
-            path=final_video_path,
+            str(final_path),
             media_type="video/mp4",
             filename="mmaudio_generated.mp4"
         )
 
     except Exception as e:
-        log.exception("[ERROR] Exception in generate_video")
-        raise HTTPException(500, detail=str(e))
+        log.exception("Error in generate_video")
+        raise HTTPException(500, str(e))
 
 
-
-# ----------------------------------------------------
-# Root endpoint
-# ----------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "variant": VARIANT, "device": DEVICE}
+    return {"status": "ok", "variant": VARIANT}
