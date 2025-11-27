@@ -13,7 +13,7 @@ from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.responses import FileResponse
 
-
+#uvicorn server:app --host 0.0.0.0 --port 8080
 
 # MMAudio imports (same as demo.py)
 from mmaudio.eval_utils import (
@@ -225,9 +225,17 @@ async def generate_video(
                 video_info.sync_frames.unsqueeze(0) if video_info.sync_frames is not None else None
             )
 
+            
+
             # Update sequence config for model
             seq_cfg.duration = video_info.duration_sec
             net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
+
+            if clip_frames is not None:
+               clip_frames = clip_frames.clone().contiguous()
+
+            if sync_frames is not None:
+               sync_frames = sync_frames.clone().contiguous()
 
             # Generate audio
             audios = generate(
