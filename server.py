@@ -13,9 +13,7 @@ from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.responses import FileResponse
 
-#   curl -X POST "https://06pk065k5dkotm-8080.proxy.runpod.net/generate_video" \
-#   -F "video=@/Users/scallercell_2/Downloads/sample.mp4" \
-#   --output result.mp4
+
 
 # MMAudio imports (same as demo.py)
 from mmaudio.eval_utils import (
@@ -172,33 +170,54 @@ async def generate_audio(
 @app.post("/generate_video")
 async def generate_video(
     video: UploadFile = File(...),
-    prompt: str = Form(...),
+    prompt: str = Form(""),
     negative_prompt: str = Form(""),
     duration: float = Form(8.0),
     cfg_strength: float = Form(4.5),
     num_steps: int = Form(25),
 ):
     """
-    Accepts an uploaded video file and returns an MP4 video where
-    MMAudio-generated audio replaces the original track.
+    Debug version: logs everything, saves all intermediate files.
     """
+
+    DEBUG_DIR = Path("/workspace/mmaudio-debug")
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
     uploaded_path = None
 
     try:
-        # Save uploaded video to a temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(video.filename).suffix) as vf:
-            uploaded_path = Path(vf.name)
-            vf.write(await video.read())
+        # -------------------------------------------
+        # Save uploaded video for inspection
+        # -------------------------------------------
+        uploaded_filename = f"uploaded_{video.filename}"
+        uploaded_path = DEBUG_DIR / uploaded_filename
 
-        log.info(f"Uploaded video stored at: {uploaded_path}")
+        with open(uploaded_path, "wb") as f:
+            f.write(await video.read())
 
+        log.info(f"[DEBUG] Uploaded video saved → {uploaded_path}")
+        log.info(f"[DEBUG] File size = {uploaded_path.stat().st_size} bytes")
+
+        if uploaded_path.stat().st_size < 1000:
+            log.error("[ERROR] Uploaded video is too small — probably corrupted upload")
+            raise HTTPException(400, "Uploaded video invalid")
+
+        # -------------------------------------------
+        # Start generation
+        # -------------------------------------------
         def gen_video_fn():
             rng = torch.Generator(device=DEVICE)
             rng.manual_seed(42)
+
             fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=num_steps)
 
             # Load frames from video
             video_info = load_video(uploaded_path, duration)
+
+            log.info(f"[DEBUG] video_info.duration_sec = {video_info.duration_sec}")
+            log.info(f"[DEBUG] clip_frames shape = {None if video_info.clip_frames is None else video_info.clip_frames.shape}")
+            log.info(f"[DEBUG] sync_frames shape = {None if video_info.sync_frames is None else video_info.sync_frames.shape}")
+
             clip_frames = (
                 video_info.clip_frames.unsqueeze(0) if video_info.clip_frames is not None else None
             )
@@ -206,15 +225,11 @@ async def generate_video(
                 video_info.sync_frames.unsqueeze(0) if video_info.sync_frames is not None else None
             )
 
-            # Adjust model for video duration
+            # Update sequence config for model
             seq_cfg.duration = video_info.duration_sec
-            net.update_seq_lengths(
-                seq_cfg.latent_seq_len,
-                seq_cfg.clip_seq_len,
-                seq_cfg.sync_seq_len
-            )
+            net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
 
-            # Generate audio conditioned on video frames
+            # Generate audio
             audios = generate(
                 clip_frames,
                 sync_frames,
@@ -228,47 +243,37 @@ async def generate_video(
             )
             audio = audios.float().cpu()[0]
 
-            # Output video path
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as out_video:
-                saved_video_path = Path(out_video.name)
+            # Save raw audio for debugging
+            raw_audio_path = DEBUG_DIR / "generated_audio.flac"
+            torchaudio.save(raw_audio_path, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
+            log.info(f"[DEBUG] Generated audio saved → {raw_audio_path}")
+            log.info(f"[DEBUG] Audio file size = {raw_audio_path.stat().st_size} bytes")
 
-            make_video(video_info, saved_video_path, audio, sampling_rate=seq_cfg.sampling_rate)
+            # Save final video
+            final_video_path = DEBUG_DIR / "final_output.mp4"
+            make_video(video_info, final_video_path, audio, sampling_rate=seq_cfg.sampling_rate)
 
-            return saved_video_path
+            log.info(f"[DEBUG] Final video saved → {final_video_path}")
+            log.info(f"[DEBUG] Final video size = {final_video_path.stat().st_size} bytes")
 
-        # Run generation in worker thread
-        new_video_path = await run_blocking(gen_video_fn)
+            return final_video_path
 
-        # Stream the MP4
-        def streamer(path):
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(1024 * 64)
-                    if not chunk:
-                        break
-                    yield chunk
-            # cleanup
-            try:
-                os.remove(path)
-                os.remove(uploaded_path)
-            except:
-                pass
+        # Run generation
+        final_video_path = await run_blocking(gen_video_fn)
 
+        # -------------------------------------------
+        # Return final file
+        # -------------------------------------------
         return FileResponse(
-    path=new_video_path,
-    media_type="video/mp4",
-    filename="mmaudio_generated.mp4"
-)
-
+            path=final_video_path,
+            media_type="video/mp4",
+            filename="mmaudio_generated.mp4"
+        )
 
     except Exception as e:
-        log.exception("Error in /generate_video")
-        try:
-            if uploaded_path and uploaded_path.exists():
-                os.remove(uploaded_path)
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=str(e))
+        log.exception("[ERROR] Exception in generate_video")
+        raise HTTPException(500, detail=str(e))
+
 
 
 # ----------------------------------------------------
