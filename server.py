@@ -206,67 +206,67 @@ async def generate_video(
         # Start generation
         # -------------------------------------------
         def gen_video_fn():
+    # RNG and sampler
             rng = torch.Generator(device=DEVICE)
             rng.manual_seed(42)
-
             fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=num_steps)
 
-            # Load frames from video
+            # load video_info (same as before)
             video_info = load_video(uploaded_path, duration)
 
             log.info(f"[DEBUG] video_info.duration_sec = {video_info.duration_sec}")
-            log.info(f"[DEBUG] clip_frames shape = {None if video_info.clip_frames is None else video_info.clip_frames.shape}")
-            log.info(f"[DEBUG] sync_frames shape = {None if video_info.sync_frames is None else video_info.sync_frames.shape}")
+            log.info(f"[DEBUG] clip_frames raw shape = {None if video_info.clip_frames is None else video_info.clip_frames.shape}")
+            log.info(f"[DEBUG] sync_frames raw shape = {None if video_info.sync_frames is None else video_info.sync_frames.shape}")
 
-            clip_frames = (
-                video_info.clip_frames.unsqueeze(0) if video_info.clip_frames is not None else None
-            )
-            sync_frames = (
-                video_info.sync_frames.unsqueeze(0) if video_info.sync_frames is not None else None
-            )
+            # Prepare clip_frames / sync_frames for the model:
+            # - move to DEVICE
+            # - clone() to get an owning tensor (break views)
+            # - detach() to ensure not attached to autograd graph
+            # - contiguous() so linear layers like it
+            if video_info.clip_frames is not None:
+                clip_frames = video_info.clip_frames.unsqueeze(0)  # (1, VN, C, H, W)
+                clip_frames = clip_frames.to(device=DEVICE)
+                clip_frames = clip_frames.clone().detach().contiguous()
+            else:
+                clip_frames = None
 
-            
+            if video_info.sync_frames is not None:
+                sync_frames = video_info.sync_frames.unsqueeze(0)  # (1, S, C, H, W)
+                sync_frames = sync_frames.to(device=DEVICE)
+                sync_frames = sync_frames.clone().detach().contiguous()
+            else:
+                sync_frames = None
 
-            # Update sequence config for model
-            seq_cfg.duration = video_info.duration_sec
-            net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
+    # update seq length (as before)
+                seq_cfg.duration = video_info.duration_sec
+                net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
 
-            if clip_frames is not None:
-               clip_frames = clip_frames.clone().contiguous()
+                # Run generate() under inference mode (disables autograd and is faster)
+                with torch.inference_mode():
+                    audios = generate(
+                        clip_frames,
+                        sync_frames,
+                        [prompt],
+                        negative_text=[negative_prompt],
+                        feature_utils=feature_utils,
+                        net=net,
+                        fm=fm,
+                        rng=rng,
+                        cfg_strength=cfg_strength,
+                    )
+                    audio = audios.float().cpu()[0]
 
-            if sync_frames is not None:
-               sync_frames = sync_frames.clone().contiguous()
+                # Save debug audio and final video as before
+                raw_audio_path = DEBUG_DIR / f"generated_audio_{abs(hash(prompt))}.flac"
+                torchaudio.save(raw_audio_path, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
+                log.info(f"[DEBUG] Generated audio saved → {raw_audio_path} ({raw_audio_path.stat().st_size} bytes)")
 
-            # Generate audio
-            audios = generate(
-                clip_frames,
-                sync_frames,
-                [prompt],
-                negative_text=[negative_prompt],
-                feature_utils=feature_utils,
-                net=net,
-                fm=fm,
-                rng=rng,
-                cfg_strength=cfg_strength,
-            )
-            audio = audios.float().cpu()[0]
+                saved_video_path = DEBUG_DIR / f"final_output_{abs(hash(prompt))}.mp4"
+                make_video(video_info, saved_video_path, audio, sampling_rate=seq_cfg.sampling_rate)
+                log.info(f"[DEBUG] Final video saved → {saved_video_path} ({saved_video_path.stat().st_size} bytes)")
 
-            # Save raw audio for debugging
-            raw_audio_path = DEBUG_DIR / "generated_audio.flac"
-            torchaudio.save(raw_audio_path, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
-            log.info(f"[DEBUG] Generated audio saved → {raw_audio_path}")
-            log.info(f"[DEBUG] Audio file size = {raw_audio_path.stat().st_size} bytes")
+                return saved_video_path
 
-            # Save final video
-            final_video_path = DEBUG_DIR / "final_output.mp4"
-            make_video(video_info, final_video_path, audio, sampling_rate=seq_cfg.sampling_rate)
-
-            log.info(f"[DEBUG] Final video saved → {final_video_path}")
-            log.info(f"[DEBUG] Final video size = {final_video_path.stat().st_size} bytes")
-
-            return final_video_path
-
-        # Run generation
         final_video_path = await run_blocking(gen_video_fn)
 
         # -------------------------------------------
