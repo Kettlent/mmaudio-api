@@ -11,6 +11,11 @@ import anyio
 
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
+
+#   curl -X POST "https://06pk065k5dkotm-8080.proxy.runpod.net/generate_video" \
+#   -F "video=@/Users/scallercell_2/Downloads/sample.mp4" \
+#   --output result.mp4
 
 # MMAudio imports (same as demo.py)
 from mmaudio.eval_utils import (
@@ -20,7 +25,7 @@ from mmaudio.eval_utils import (
 from mmaudio.model.flow_matching import FlowMatching
 from mmaudio.model.networks import MMAudio, get_my_mmaudio
 from mmaudio.model.utils.features_utils import FeaturesUtils
-
+from starlette.background import BackgroundTask
 
 # ----------------------------------------------------
 # Basic Setup
@@ -140,13 +145,21 @@ async def generate_audio(
         torchaudio.save(buffer, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
         buffer.seek(0)
 
+        # Save buffer to a temporary FLAC file
         filename = f"mmaudio_{abs(hash(prompt))}.flac"
+        temp_path = tempfile.NamedTemporaryFile(delete=False, suffix=".flac").name
 
-        return StreamingResponse(
-            buffer,
-            media_type="audio/flac",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
+        with open(temp_path, "wb") as f:
+             f.write(buffer.getvalue())
+
+# Return full FLAC file
+        return FileResponse(
+                 path=temp_path,
+                 media_type="audio/flac",
+                 filename=filename,
+                 background=BackgroundTask(lambda: os.remove(temp_path))
+)
+
 
     except Exception as e:
         log.exception("Error in /generate_audio")
@@ -241,13 +254,12 @@ async def generate_video(
             except:
                 pass
 
-        return StreamingResponse(
-            streamer(new_video_path),
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f"attachment; filename=mmaudio_generated.mp4"
-            }
-        )
+        return FileResponse(
+    path=new_video_path,
+    media_type="video/mp4",
+    filename="mmaudio_generated.mp4"
+)
+
 
     except Exception as e:
         log.exception("Error in /generate_video")
