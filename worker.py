@@ -202,10 +202,11 @@ def process_job(job_id: str, job_data: dict, net, feature_utils, seq_cfg):
         # 3) COMPOSE FINAL VIDEO
         # make_video expects 1D audio
         # --------------------------------------------
-        audio_for_video = audio2.squeeze(0)  # back to (samples,)
+        audio_np = audio2.squeeze(0).cpu().numpy().astype("float32")  # (samples,)
+        audio_np = audio_np.reshape(-1, 1)  # (samples, 1) REQUIRED
 
         output_path = job_folder / "output.mp4"
-        make_video(video_info, output_path, audio_for_video, sampling_rate=seq_cfg.sampling_rate)
+        make_video(video_info, output_path, audio_np, sampling_rate=seq_cfg.sampling_rate)
 
         set_progress(job_id, 100)
         set_status(job_id, "done")
