@@ -1,89 +1,69 @@
 #!/bin/bash
 
-##########################################################################
-#  MMAudio Full Background Startup + Watchdog (RunPod Safe)
-##########################################################################
+### -------------------------
+### MMAudio Auto-Start Script
+### -------------------------
 
-set -e
-
+API_DIR="$(dirname "$0")"
 CONDA_BASE="/workspace/miniconda"
 CONDA_SH="$CONDA_BASE/etc/profile.d/conda.sh"
 ENV_NAME="mmaudio"
-API_DIR="$(dirname "$0")"
-
-WORKER="$API_DIR/worker.py"
-SERVER="$API_DIR/server.py"
 
 WORKER_LOG="$API_DIR/worker.log"
 SERVER_LOG="$API_DIR/server.log"
-WATCHDOG_LOG="$API_DIR/watchdog.log"
 
 echo ""
-echo "-------------------------------------------------" | tee -a "$WATCHDOG_LOG"
-echo "[BOOT] Starting MMAudio Background System at $(date)" | tee -a "$WATCHDOG_LOG"
-echo "-------------------------------------------------" | tee -a "$WATCHDOG_LOG"
+echo "-----------------------------------"
+echo "Starting MMAudio at $(date)"
+echo "-----------------------------------"
 
-##########################################################################
-# LOAD CONDA ENVIRONMENT
-##########################################################################
-echo "[INFO] Loading conda..." | tee -a "$WATCHDOG_LOG"
-source "$CONDA_SH"
+### Load conda
+if [ -f "$CONDA_SH" ]; then
+    echo "[OK] Loading conda..."
+    source "$CONDA_SH"
+else
+    echo "[ERROR] conda.sh not found!"
+    exit 1
+fi
 
-echo "[INFO] Activating environment: $ENV_NAME" | tee -a "$WATCHDOG_LOG"
+### Activate environment
+echo "[OK] Activating conda env: $ENV_NAME"
 conda activate "$ENV_NAME"
 
-##########################################################################
-# KILL OLD PROCESSES
-##########################################################################
-echo "[INFO] Stopping old worker/server processes..." | tee -a "$WATCHDOG_LOG"
+### Kill old processes
+echo "[INFO] Killing old worker/server processes..."
 pkill -f "worker.py" || true
 pkill -f "server.py" || true
-
 sleep 1
 
-##########################################################################
-# START WORKER IN BACKGROUND (nohup)
-##########################################################################
-start_worker() {
-    echo "[START] Launching worker..." | tee -a "$WATCHDOG_LOG"
-    nohup python3 "$WORKER" >> "$WORKER_LOG" 2>&1 &
-    sleep 2
-}
+### -------------------------
+### Start worker in background
+### -------------------------
+echo "[START] Launching worker.py (background)..."
 
-##########################################################################
-# START SERVER IN BACKGROUND (nohup)
-##########################################################################
-start_server() {
-    echo "[START] Launching server..." | tee -a "$WATCHDOG_LOG"
-    nohup python3 "$SERVER" >> "$SERVER_LOG" 2>&1 &
-    sleep 2
-}
+nohup python3 "$API_DIR/worker.py" \
+    >> "$WORKER_LOG" 2>&1 &
 
-##########################################################################
-# INITIAL STARTUP
-##########################################################################
-start_worker
-start_server
+sleep 2
+WORKER_PID=$(pgrep -f "worker.py")
+echo "[OK] Worker running PID: $WORKER_PID"
+echo "Worker log: $WORKER_LOG"
 
-##########################################################################
-# WATCHDOG — RUNS FOREGROUND (required by RunPod)
-##########################################################################
-echo "[INFO] Watchdog is running and supervising processes..." | tee -a "$WATCHDOG_LOG"
-echo "[INFO] Close SSH safely — system stays alive." | tee -a "$WATCHDOG_LOG"
-echo "-------------------------------------------------" | tee -a "$WATCHDOG_LOG"
+### -------------------------
+### Start server in background
+### -------------------------
+echo "[START] Launching FastAPI server (background)..."
 
-while true; do
-    # Check worker
-    if ! pgrep -f "worker.py" > /dev/null; then
-        echo "[WARN] Worker died — restarting..." | tee -a "$WATCHDOG_LOG"
-        start_worker
-    fi
+nohup uvicorn server:app \
+    --host 0.0.0.0 \
+    --port 8080 \
+    >> "$SERVER_LOG" 2>&1 &
 
-    # Check server
-    if ! pgrep -f "server.py" > /dev/null; then
-        echo "[WARN] Server died — restarting..." | tee -a "$WATCHDOG_LOG"
-        start_server
-    fi
+sleep 2
+SERVER_PID=$(pgrep -f "uvicorn server:app")
+echo "[OK] Server running PID: $SERVER_PID"
+echo "Server log: $SERVER_LOG"
 
-    sleep 3
-done
+echo "-----------------------------------"
+echo "MMAudio Startup Complete (Background Mode)"
+echo "-----------------------------------"
