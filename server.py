@@ -40,86 +40,129 @@
 
 
 # server.py
-import uuid
 import json
+import os
+import uuid
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import FileResponse, StreamingResponse
+from typing import Optional
 
-JOB_DIR = Path("./jobs")
+from fastapi import FastAPI, UploadFile, Form, File
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+import anyio
+
+BASE_DIR = Path("/workspace/mmaudio-api")
+JOB_DIR = BASE_DIR / "jobs"
+QUEUE_FILE = BASE_DIR / "queue.json"
+
 JOB_DIR.mkdir(exist_ok=True)
 
-app = FastAPI()
+app = FastAPI(title="MMAudio API")
 
-QUEUE_PATH = JOB_DIR / "queue.json"
-if not QUEUE_PATH.exists():
-    QUEUE_PATH.write_text("[]")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 
-def add_job(job):
-    queue = json.loads(QUEUE_PATH.read_text())
-    queue.append(job)
-    QUEUE_PATH.write_text(json.dumps(queue))
+def enqueue_job(data):
+    job_id = str(uuid.uuid4())
+    folder = JOB_DIR / job_id
+    folder.mkdir(exist_ok=True)
+
+    data["job_id"] = job_id
+
+    if QUEUE_FILE.exists():
+        queue = json.loads(QUEUE_FILE.read_text())
+    else:
+        queue = []
+
+    queue.append(data)
+    QUEUE_FILE.write_text(json.dumps(queue, indent=2))
+    return job_id
 
 
 @app.post("/generate_video")
 async def generate_video(
-    video: UploadFile = File(...),
     prompt: str = Form(...),
+    negative_prompt: str = Form(""),
     duration: float = Form(8.0),
     cfg_strength: float = Form(4.5),
     num_steps: int = Form(25),
+    video: UploadFile = File(...)
 ):
+
     job_id = str(uuid.uuid4())
+    folder = JOB_DIR / job_id
+    folder.mkdir(exist_ok=True)
 
-    input_path = JOB_DIR / f"{job_id}_input.mp4"
-    input_path.write_bytes(await video.read())
+    input_video_path = folder / "input.mp4"
+    with open(input_video_path, "wb") as f:
+        f.write(await video.read())
 
-    add_job({
-        "job_id": job_id,
-        "prompt": prompt,
-        "duration": duration,
-        "cfg_strength": cfg_strength,
-        "num_steps": num_steps,
-        "input_path": str(input_path)
-    })
+    job_data = dict(
+        job_id=job_id,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        duration=duration,
+        cfg_strength=cfg_strength,
+        num_steps=num_steps,
+        input_video=str(input_video_path),
+    )
+
+    if QUEUE_FILE.exists():
+        queue = json.loads(QUEUE_FILE.read_text())
+    else:
+        queue = []
+    queue.append(job_data)
+    QUEUE_FILE.write_text(json.dumps(queue, indent=2))
 
     return {"job_id": job_id}
 
 
 @app.get("/progress/{job_id}")
 async def progress(job_id: str):
-    """ SSE stream of progress """
-    async def event_stream():
-        progress_file = JOB_DIR / f"{job_id}_progress.txt"
-        status_file = JOB_DIR / f"{job_id}_status.txt"
+    progress_file = JOB_DIR / job_id / "progress.txt"
 
+    async def streamer():
         last_value = None
-
         while True:
-            if status_file.exists():
-                status = status_file.read_text()
-                if "done" in status:
-                    yield f"data: 100\n\n"
-                    break
-                if "error" in status:
-                    yield f"data: error\n\n"
-                    break
-
             if progress_file.exists():
-                pct = progress_file.read_text()
-                if pct != last_value:
-                    last_value = pct
-                    yield f"data: {pct}\n\n"
+                value = progress_file.read_text()
+                if value != last_value:
+                    yield f"data: {value}\n\n"
+                    last_value = value
+            await anyio.sleep(0.5)
 
-            await asyncio.sleep(0.5)
+    return StreamingResponse(streamer(), media_type="text/event-stream")
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.get("/status/{job_id}")
+def status(job_id: str):
+    status_file = JOB_DIR / job_id / "status.txt"
+    if not status_file.exists():
+        return {"status": "pending"}
+    return {"status": status_file.read_text()}
 
 
 @app.get("/result/{job_id}")
 def result(job_id: str):
-    file_path = JOB_DIR / f"{job_id}_output.mp4"
-    if file_path.exists():
-        return FileResponse(file_path, media_type="video/mp4", filename="generated.mp4")
-    return {"error": "not_ready"}
+    output_video = JOB_DIR / job_id / "output.mp4"
+    if not output_video.exists():
+        return {"error": "not_ready"}
+
+    return FileResponse(
+        str(output_video),
+        media_type="video/mp4",
+        filename=f"{job_id}.mp4",
+        headers={"Content-Disposition": f'attachment; filename="{job_id}.mp4"'}
+    )
+
+
+@app.get("/")
+def root():
+    return {"status": "mmaudio server running"}
+
