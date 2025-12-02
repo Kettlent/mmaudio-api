@@ -185,16 +185,16 @@ def process_job(job_id: str, job_data: dict, net, feature_utils, seq_cfg):
         log.info(f"[JOB {job_id}] Raw audio shape: {audio.shape}")
 
         # Normalize audio to (1, samples)
-        audio2 = normalize_audio(audio)
-        log.info(f"[JOB {job_id}] Normalized audio shape: {audio2.shape}")
+        # audio2 = normalize_audio(audio)
+        #log.info(f"[JOB {job_id}] Normalized audio shape: {audio2.shape}")
 
-        audio_path = job_folder / "audio.flac"
-        torchaudio.save(
-            str(audio_path),
-            audio2,  # ALWAYS valid 2D
-            seq_cfg.sampling_rate,
-            format="FLAC"
-        )
+        #audio_path = job_folder / "audio.flac"
+        # torchaudio.save(
+        #     str(audio_path),
+        #     audio,  # ALWAYS valid 2D
+        #     seq_cfg.sampling_rate,
+        #     format="FLAC"
+        # )
 
         set_progress(job_id, 65)
 
@@ -202,11 +202,11 @@ def process_job(job_id: str, job_data: dict, net, feature_utils, seq_cfg):
         # 3) COMPOSE FINAL VIDEO
         # make_video expects 1D audio
         # --------------------------------------------
-        audio_np = audio2.squeeze(0).cpu().numpy().astype("float32")  # (samples,)
-        audio_np = audio_np.reshape(-1, 1)  # (samples, 1) REQUIRED
+        # audio_np = audio2.squeeze(0).cpu().numpy().astype("float32")  # (samples,)
+        # audio_np = audio_np.reshape(-1, 1)  # (samples, 1) REQUIRED
 
         output_path = job_folder / "output.mp4"
-        make_video(video_info, output_path, audio_np, sampling_rate=seq_cfg.sampling_rate)
+        make_video(video_info, output_path, audio, sampling_rate=seq_cfg.sampling_rate)
 
         set_progress(job_id, 100)
         set_status(job_id, "done")
