@@ -13,20 +13,67 @@ from mmaudio.model.flow_matching import FlowMatching
 from mmaudio.model.networks import MMAudio, get_my_mmaudio
 from mmaudio.model.utils.features_utils import FeaturesUtils
 
-logging.basicConfig(level=logging.INFO)
+
+# ------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("mmaudio-worker")
 
+
+# ------------------------------------------------------
+# PATHS
+# ------------------------------------------------------
 BASE_DIR = Path("/workspace/mmaudio-api")
 JOB_DIR = BASE_DIR / "jobs"
 QUEUE_FILE = BASE_DIR / "queue.json"
 
 JOB_DIR.mkdir(exist_ok=True)
+if not QUEUE_FILE.exists():
+    QUEUE_FILE.write_text("[]")
 
+
+# ------------------------------------------------------
+# MODEL SETTINGS
+# ------------------------------------------------------
 VARIANT = "large_44k_v2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
 
+# ------------------------------------------------------
+# SAFE AUDIO NORMALIZATION
+# Converts any MMAudio output to (1, samples)
+# ------------------------------------------------------
+def normalize_audio(audio: torch.Tensor) -> torch.Tensor:
+    """
+    Ensures audio is always shape (1, samples) for torchaudio.save().
+    MMAudio sometimes returns (samples,), sometimes (samples,1).
+    """
+    if audio.ndim == 1:
+        return audio.unsqueeze(0)  # (1, N)
+
+    if audio.ndim == 2:
+        # Case: (samples, 1)
+        if audio.shape[1] == 1:
+            return audio.squeeze(1).unsqueeze(0)  # (1, N)
+        # Already (1, samples)
+        if audio.shape[0] == 1:
+            return audio
+        # Rare weird case: swap
+        return audio.mean(dim=0, keepdim=True)
+
+    if audio.ndim == 3:
+        # e.g. (1, samples, 1)
+        if audio.shape[0] == 1 and audio.shape[2] == 1:
+            return audio.squeeze(2)  # → (1, samples)
+
+    raise RuntimeError(f"Unexpected audio shape: {audio.shape}")
+
+
+# ------------------------------------------------------
+# MODEL LOADING ONCE PER WORKER
+# ------------------------------------------------------
 def load_model():
     log.info("Loading MMAudio model...")
 
@@ -49,9 +96,12 @@ def load_model():
     seq_cfg = model_cfg.seq_cfg
 
     log.info("Model loaded successfully.")
-    return net, feature_utils, seq_cfg, model_cfg
+    return net, feature_utils, seq_cfg
 
 
+# ------------------------------------------------------
+# JOB STATUS HELPERS
+# ------------------------------------------------------
 def set_progress(job_id: str, value: int | float):
     (JOB_DIR / job_id / "progress.txt").write_text(str(value))
 
@@ -60,40 +110,44 @@ def set_status(job_id: str, value: str):
     (JOB_DIR / job_id / "status.txt").write_text(value)
 
 
-def process_job(job_id: str, job_data: dict, net: MMAudio, feature_utils: FeaturesUtils, seq_cfg):
+# ------------------------------------------------------
+# MAIN JOB EXECUTION
+# ------------------------------------------------------
+def process_job(job_id: str, job_data: dict, net, feature_utils, seq_cfg):
+    log.info(f"[JOB {job_id}] Starting...")
+
     job_folder = JOB_DIR / job_id
     job_folder.mkdir(exist_ok=True)
 
-    input_video = job_data["input_video"]  # full path string
+    input_video = Path(job_data["input_video"])
     prompt = job_data["prompt"]
     negative_prompt = job_data["negative_prompt"]
     duration = float(job_data["duration"])
     cfg_strength = float(job_data["cfg_strength"])
     num_steps = int(job_data["num_steps"])
 
-    # We already saved the uploaded file into this path in server.py
-    local_video_path = Path(input_video)
-    log.info(f"[JOB {job_id}] Using uploaded video at {local_video_path}")
+    # The uploaded video is already in the job folder → no copy!
+    local_video_path = input_video
+    log.info(f"[JOB {job_id}] Using video: {local_video_path}")
 
     try:
         set_status(job_id, "running")
         set_progress(job_id, 5)
 
-        # 1) Load video and extract frames
+        # --------------------------------------------
+        # 1) LOAD VIDEO FRAMES
+        # --------------------------------------------
         video_info = load_video(local_video_path, duration)
 
         clip_frames = (
             video_info.clip_frames.unsqueeze(0)
-            if video_info.clip_frames is not None
-            else None
+            if video_info.clip_frames is not None else None
         )
         sync_frames = (
             video_info.sync_frames.unsqueeze(0)
-            if video_info.sync_frames is not None
-            else None
+            if video_info.sync_frames is not None else None
         )
 
-        # 2) Match sequence config to video duration
         seq_cfg.duration = video_info.duration_sec
         net.update_seq_lengths(
             seq_cfg.latent_seq_len,
@@ -109,9 +163,11 @@ def process_job(job_id: str, job_data: dict, net: MMAudio, feature_utils: Featur
             num_steps=num_steps
         )
 
-        set_progress(job_id, 30)
+        set_progress(job_id, 25)
 
-        # 3) Generate audio
+        # --------------------------------------------
+        # 2) GENERATE AUDIO
+        # --------------------------------------------
         with torch.inference_mode():
             audios = generate(
                 clip_frames,
@@ -125,53 +181,69 @@ def process_job(job_id: str, job_data: dict, net: MMAudio, feature_utils: Featur
                 cfg_strength=cfg_strength
             )
 
-        audio = audios.float().cpu()[0]  # (samples,)
+        audio = audios.float().cpu()[0]
+        log.info(f"[JOB {job_id}] Raw audio shape: {audio.shape}")
+
+        # Normalize audio to (1, samples)
+        audio2 = normalize_audio(audio)
+        log.info(f"[JOB {job_id}] Normalized audio shape: {audio2.shape}")
 
         audio_path = job_folder / "audio.flac"
         torchaudio.save(
             str(audio_path),
-            audio.unsqueeze(0),  # (1, samples)
+            audio2,  # ALWAYS valid 2D
             seq_cfg.sampling_rate,
             format="FLAC"
         )
 
-        set_progress(job_id, 70)
+        set_progress(job_id, 65)
 
-        # 4) Compose final video with audio
+        # --------------------------------------------
+        # 3) COMPOSE FINAL VIDEO
+        # make_video expects 1D audio
+        # --------------------------------------------
+        audio_for_video = audio2.squeeze(0)  # back to (samples,)
+
         output_path = job_folder / "output.mp4"
-        make_video(video_info, output_path, audio, sampling_rate=seq_cfg.sampling_rate)
+        make_video(video_info, output_path, audio_for_video, sampling_rate=seq_cfg.sampling_rate)
 
         set_progress(job_id, 100)
         set_status(job_id, "done")
-        log.info(f"[JOB {job_id}] Completed -> {output_path}")
+
+        log.info(f"[JOB {job_id}] Completed successfully → {output_path}")
 
     except Exception as e:
         set_status(job_id, f"error: {e}")
         log.exception(f"[JOB {job_id}] ERROR: {e}")
 
 
+# ------------------------------------------------------
+# WORKER LOOP
+# ------------------------------------------------------
 def main():
-    net, feature_utils, seq_cfg, model_cfg = load_model()
+    net, feature_utils, seq_cfg = load_model()
 
     log.info("Worker started. Waiting for jobs...")
 
     while True:
-        # read queue
-        if QUEUE_FILE.exists():
-            try:
-                queue = json.loads(QUEUE_FILE.read_text())
-            except Exception:
+        try:
+            if QUEUE_FILE.exists():
+                try:
+                    queue = json.loads(QUEUE_FILE.read_text())
+                except Exception:
+                    queue = []
+            else:
                 queue = []
-        else:
-            queue = []
 
-        if queue:
-            job = queue.pop(0)
-            QUEUE_FILE.write_text(json.dumps(queue, indent=2))
+            if queue:
+                job = queue.pop(0)
+                QUEUE_FILE.write_text(json.dumps(queue, indent=2))
 
-            job_id = job["job_id"]
-            log.info(f"[JOB {job_id}] Taken from queue.")
-            process_job(job_id, job, net, feature_utils, seq_cfg)
+                job_id = job["job_id"]
+                process_job(job_id, job, net, feature_utils, seq_cfg)
+
+        except Exception as e:
+            log.error(f"WORKER LOOP ERROR: {e}")
 
         time.sleep(1)
 
