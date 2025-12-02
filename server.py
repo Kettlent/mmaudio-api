@@ -32,246 +32,94 @@
 # bash /workspace/start.sh
 # tail -50 /workspace/cosyvoice.log
 
+# curl -X POST "https://06pk065k5dkotm-8080.proxy.runpod.net/generate_video" \
+#   -F "prompt=" \
+#   -F "negative_prompt=" \
+#   -F "video=@/Users/scallercell_2/Downloads/silencevideo.mp4"
+
+
 
 # server.py
-import logging
-import io
-import os
-import tempfile
-from pathlib import Path
 import uuid
-import asyncio
+import json
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import FileResponse, StreamingResponse
 
-import torch
-import torchaudio
-import anyio
+JOB_DIR = Path("./jobs")
+JOB_DIR.mkdir(exist_ok=True)
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+app = FastAPI()
 
-# MMAudio imports
-from mmaudio.eval_utils import (
-    ModelConfig, all_model_cfg, generate, load_video, make_video, setup_eval_logging
-)
-from mmaudio.model.flow_matching import FlowMatching
-from mmaudio.model.networks import MMAudio, get_my_mmaudio
-from mmaudio.model.utils.features_utils import FeaturesUtils
+QUEUE_PATH = JOB_DIR / "queue.json"
+if not QUEUE_PATH.exists():
+    QUEUE_PATH.write_text("[]")
 
 
-# ---------------------------------------------------------
-# LOGGING SETUP
-# ---------------------------------------------------------
-log = logging.getLogger("mmaudio-fastapi")
-logging.basicConfig(level=logging.INFO)
-
-app = FastAPI(title="MMAudio FastAPI (SSE Enabled)")
-
-# ---------------------------------------------------------
-# GLOBALS
-# ---------------------------------------------------------
-
-VARIANT = "large_44k_v2"
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
-
-model_cfg = None
-seq_cfg = None
-net = None
-feature_utils = None
-
-# Job tracking
-job_status = {}   # job_id → dict(status, progress, result, error)
-job_locks = {}    # job_id → asyncio.Lock()
-
-DEBUG_DIR = Path("/workspace/mmaudio-debug")
-DEBUG_DIR.mkdir(exist_ok=True)
+def add_job(job):
+    queue = json.loads(QUEUE_PATH.read_text())
+    queue.append(job)
+    QUEUE_PATH.write_text(json.dumps(queue))
 
 
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
-
-async def run_blocking(fn, *args, **kwargs):
-    """Runs CPU/GPU heavy work in thread-safe worker."""
-    return await anyio.to_thread.run_sync(lambda: fn(*args, **kwargs))
-
-
-def update_progress(job_id: str, progress: int):
-    if job_id in job_status:
-        job_status[job_id]["progress"] = progress
-        log.info(f"[JOB {job_id}] Progress = {progress}%")
-
-
-# ---------------------------------------------------------
-# MODEL LOADING
-# ---------------------------------------------------------
-@app.on_event("startup")
-def load_model():
-    global model_cfg, seq_cfg, net, feature_utils
-
-    setup_eval_logging()
-    log.info(f"Loading MMAudio model variant: {VARIANT}")
-
-    model_cfg = all_model_cfg[VARIANT]
-    model_cfg.download_if_needed()
-    seq_cfg = model_cfg.seq_cfg
-
-    log.info(f"Device: {DEVICE}, dtype: {DTYPE}")
-
-    # Load network
-    net = get_my_mmaudio(model_cfg.model_name).to(DEVICE, DTYPE).eval()
-    weights = torch.load(model_cfg.model_path, map_location=DEVICE, weights_only=True)
-    net.load_weights(weights)
-
-    # Feature utils
-    feature_utils = FeaturesUtils(
-        tod_vae_ckpt=model_cfg.vae_path,
-        synchformer_ckpt=model_cfg.synchformer_ckpt,
-        enable_conditions=True,
-        mode=model_cfg.mode,
-        bigvgan_vocoder_ckpt=model_cfg.bigvgan_16k_path,
-        need_vae_encoder=False
-    ).to(DEVICE, DTYPE).eval()
-
-    log.info("MMAudio model & utilities loaded successfully.")
-
-
-# ---------------------------------------------------------
-# GENERATE VIDEO (Runs as background job)
-# ---------------------------------------------------------
 @app.post("/generate_video")
 async def generate_video(
     video: UploadFile = File(...),
     prompt: str = Form(...),
-    negative_prompt: str = Form(""),
     duration: float = Form(8.0),
     cfg_strength: float = Form(4.5),
-    num_steps: int = Form(25)
+    num_steps: int = Form(25),
 ):
     job_id = str(uuid.uuid4())
 
-    # Create job entry
-    job_status[job_id] = {
-        "status": "queued",
-        "progress": 0,
-        "result": None,
-        "error": None
-    }
-    job_locks[job_id] = asyncio.Lock()
+    input_path = JOB_DIR / f"{job_id}_input.mp4"
+    input_path.write_bytes(await video.read())
 
-    # Save uploaded video
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
-        uploaded_video_path = Path(f.name)
-        f.write(await video.read())
+    add_job({
+        "job_id": job_id,
+        "prompt": prompt,
+        "duration": duration,
+        "cfg_strength": cfg_strength,
+        "num_steps": num_steps,
+        "input_path": str(input_path)
+    })
 
-    log.info(f"[JOB {job_id}] Saved uploaded video → {uploaded_video_path}")
-
-    # Background task --------------------------------------
-    async def job_thread():
-        async with job_locks[job_id]:
-            try:
-                job_status[job_id]["status"] = "processing"
-                update_progress(job_id, 5)
-
-                # Load video
-                video_info = await run_blocking(load_video, uploaded_video_path, duration)
-                update_progress(job_id, 20)
-
-                # Prepare RNG/FlowMatching
-                fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=num_steps)
-                rng = torch.Generator(device=DEVICE)
-                rng.manual_seed(42)
-
-                # Update seq config to match actual video duration
-                seq_cfg.duration = video_info.duration_sec
-                net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
-
-                # Generate audio
-                def generate_audio_block():
-                    return generate(
-                        video_info.clip_frames.unsqueeze(0),
-                        video_info.sync_frames.unsqueeze(0),
-                        [prompt],
-                        negative_text=[negative_prompt],
-                        feature_utils=feature_utils,
-                        net=net,
-                        fm=fm,
-                        rng=rng,
-                        cfg_strength=cfg_strength
-                    ).float().cpu()[0]
-
-                audio = await run_blocking(generate_audio_block)
-                update_progress(job_id, 70)
-
-                # Save audio
-                audio_path = DEBUG_DIR / f"{job_id}.flac"
-                torchaudio.save(audio_path, audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
-                update_progress(job_id, 85)
-
-                # Generate final MP4
-                final_video_path = DEBUG_DIR / f"{job_id}.mp4"
-                await run_blocking(make_video, video_info, final_video_path, audio, seq_cfg.sampling_rate)
-
-                update_progress(job_id, 100)
-
-                job_status[job_id]["status"] = "done"
-                job_status[job_id]["result"] = str(final_video_path)
-
-                log.info(f"[JOB {job_id}] Completed → {final_video_path}")
-
-            except Exception as e:
-                job_status[job_id]["status"] = "error"
-                job_status[job_id]["error"] = str(e)
-                log.error(f"[JOB {job_id}] ERROR → {e}")
-
-    # Start background job
-    asyncio.create_task(job_thread())
-
-    # Return job_id immediately
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id}
 
 
-# ---------------------------------------------------------
-# SSE PROGRESS STREAM
-# ---------------------------------------------------------
 @app.get("/progress/{job_id}")
-async def progress_stream(job_id: str):
+async def progress(job_id: str):
+    """ SSE stream of progress """
+    async def event_stream():
+        progress_file = JOB_DIR / f"{job_id}_progress.txt"
+        status_file = JOB_DIR / f"{job_id}_status.txt"
 
-    async def event_gen():
-        last_progress = -1
+        last_value = None
 
         while True:
-            job = job_status.get(job_id)
-            if not job:
-                yield "event: error\ndata: Job not found\n\n"
-                break
+            if status_file.exists():
+                status = status_file.read_text()
+                if "done" in status:
+                    yield f"data: 100\n\n"
+                    break
+                if "error" in status:
+                    yield f"data: error\n\n"
+                    break
 
-            status = job["status"]
-            progress = job["progress"]
-
-            # Send progress only if new
-            if progress != last_progress:
-                last_progress = progress
-                yield f"event: progress\ndata: {progress}\n\n"
-
-            if status == "done":
-                result = job["result"]
-                yield f"event: done\ndata: {result}\n\n"
-                break
-
-            if status == "error":
-                yield f"event: error\ndata: {job['error']}\n\n"
-                break
+            if progress_file.exists():
+                pct = progress_file.read_text()
+                if pct != last_value:
+                    last_value = pct
+                    yield f"data: {pct}\n\n"
 
             await asyncio.sleep(0.5)
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-# ---------------------------------------------------------
-# ROOT
-# ---------------------------------------------------------
-@app.get("/")
-def root():
-    return {"status": "mmaudio server running", "variant": VARIANT}
+@app.get("/result/{job_id}")
+def result(job_id: str):
+    file_path = JOB_DIR / f"{job_id}_output.mp4"
+    if file_path.exists():
+        return FileResponse(file_path, media_type="video/mp4", filename="generated.mp4")
+    return {"error": "not_ready"}

@@ -1,104 +1,140 @@
 import os
-import json
 import time
+import json
+import uuid
 import torch
-import torchaudio
+import logging
 from pathlib import Path
-from mmaudio.eval_utils import load_video, generate, make_video
+
+from mmaudio.eval_utils import (ModelConfig, all_model_cfg, generate,
+                                load_video, make_video)
 from mmaudio.model.flow_matching import FlowMatching
-from mmaudio.model.networks import get_my_mmaudio
+from mmaudio.model.networks import MMAudio, get_my_mmaudio
 from mmaudio.model.utils.features_utils import FeaturesUtils
-from mmaudio.eval_utils import all_model_cfg
 
-JOBS_DIR = Path("/workspace/mmaudio-jobs")
-INCOMING = JOBS_DIR / "incoming"
-DONE = JOBS_DIR / "done"
-LOGS = JOBS_DIR / "logs"
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("mmaudio-worker")
 
-VARIANT = "large_44k_v2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+VARIANT = "large_44k_v2"
+
+JOB_DIR = Path("./jobs")
+JOB_DIR.mkdir(exist_ok=True)
 
 def load_model():
-    model_cfg = all_model_cfg[VARIANT]
+    log.info("Loading MMAudio model...")
+    model_cfg: ModelConfig = all_model_cfg[VARIANT]
     model_cfg.download_if_needed()
-    seq_cfg = model_cfg.seq_cfg
 
-    net = get_my_mmaudio(model_cfg.model_name).to(DEVICE, DTYPE).eval()
-    weights = torch.load(model_cfg.model_path, map_location=DEVICE, weights_only=True)
-    net.load_weights(weights)
+    net: MMAudio = get_my_mmaudio(model_cfg.model_name).to(DEVICE, DTYPE).eval()
+    net.load_weights(torch.load(model_cfg.model_path, map_location=DEVICE, weights_only=True))
 
     feature_utils = FeaturesUtils(
         tod_vae_ckpt=model_cfg.vae_path,
         synchformer_ckpt=model_cfg.synchformer_ckpt,
-        mode=model_cfg.mode,
         enable_conditions=True,
+        mode=model_cfg.mode,
         bigvgan_vocoder_ckpt=model_cfg.bigvgan_16k_path,
         need_vae_encoder=False
     ).to(DEVICE, DTYPE).eval()
 
-    return net, feature_utils, seq_cfg, model_cfg
+    return model_cfg, net, feature_utils
+
+model_cfg, net, feature_utils = load_model()
 
 
-net, feature_utils, seq_cfg, model_cfg = load_model()
-print("Worker loaded model successfully.")
-
-def process_job(job_file):
-    job_data = json.loads(job_file.read_text())
-
-    job_id = job_data["job_id"]
-    prompt = job_data["prompt"]
-    negative = job_data["negative_prompt"]
-    duration = job_data["duration"]
-    cfg_strength = job_data["cfg_strength"]
-    num_steps = job_data["num_steps"]
-    video_path = Path(job_data["video_path"])
-
-    out_video_path = DONE / f"{job_id}.mp4"
-    audio_path = DONE / f"{job_id}.flac"
-
-    try:
-        # Load video
-        video_info = load_video(video_path, duration)
-        seq_cfg.duration = video_info.duration_sec
-        net.update_seq_lengths(seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len)
-
-        rng = torch.Generator(device=DEVICE).manual_seed(42)
-        fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=num_steps)
-
-        clip = video_info.clip_frames.unsqueeze(0)
-        sync = video_info.sync_frames.unsqueeze(0)
-
-        with torch.no_grad():
-            audios = generate(
-                clip, sync, [prompt],
-                negative_text=[negative],
-                feature_utils=feature_utils,
-                net=net, fm=fm, rng=rng,
-                cfg_strength=cfg_strength
-            )
-
-        audio = audios.float().cpu()[0]
-        torchaudio.save(str(audio_path), audio.unsqueeze(0), seq_cfg.sampling_rate, format="FLAC")
-
-        make_video(video_info, out_video_path, audio, sampling_rate=seq_cfg.sampling_rate)
-
-        (DONE / f"{job_id}.json").write_text(json.dumps({"status": "done"}))
-
-        print(f"[Worker] Job {job_id} complete.")
-
-    except Exception as e:
-        print("Worker error:", e)
-        (DONE / f"{job_id}.json").write_text(json.dumps({"status": "error", "detail": str(e)}))
+def update_progress(job_id, pct):
+    (JOB_DIR / f"{job_id}_progress.txt").write_text(str(pct))
 
 
-def main():
-    print("Worker started. Watching for jobs...")
+def update_status(job_id, msg):
+    (JOB_DIR / f"{job_id}_status.txt").write_text(msg)
+
+
+def worker_loop():
+    log.info("Worker started. Waiting for jobs...")
+
     while True:
-        for job_file in INCOMING.glob("*.json"):
-            process_job(job_file)
-            os.remove(job_file)
-        time.sleep(1)
+        queue_path = JOB_DIR / "queue.json"
+
+        if not queue_path.exists():
+            time.sleep(0.5)
+            continue
+
+        try:
+            queue = json.loads(queue_path.read_text())
+        except:
+            time.sleep(0.5)
+            continue
+
+        if len(queue) == 0:
+            time.sleep(0.3)
+            continue
+
+        job = queue.pop(0)
+        queue_path.write_text(json.dumps(queue))
+
+        job_id = job["job_id"]
+        prompt = job["prompt"]
+        input_path = Path(job["input_path"])
+        duration = float(job["duration"])
+        cfg_strength = float(job["cfg_strength"])
+        num_steps = int(job["num_steps"])
+
+        update_status(job_id, "processing")
+
+        try:
+            # Step 1: load video
+            update_progress(job_id, 5)
+            video_info = load_video(input_path, duration)
+            clip_frames = video_info.clip_frames.unsqueeze(0) if video_info.clip_frames is not None else None
+            sync_frames = video_info.sync_frames.unsqueeze(0) if video_info.sync_frames is not None else None
+
+            # Step 2: setup FM + RNG
+            update_progress(job_id, 15)
+            rng = torch.Generator(device=DEVICE)
+            rng.manual_seed(42)
+            fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=num_steps)
+
+            # Step 3: match seq length
+            update_progress(job_id, 30)
+            model_cfg.seq_cfg.duration = video_info.duration_sec
+            net.update_seq_lengths(model_cfg.seq_cfg.latent_seq_len,
+                                   model_cfg.seq_cfg.clip_seq_len,
+                                   model_cfg.seq_cfg.sync_seq_len)
+
+            # Step 4: generate audio
+            update_progress(job_id, 60)
+            with torch.inference_mode():
+                audios = generate(
+                    clip_frames,
+                    sync_frames,
+                    [prompt],
+                    negative_text=[""],
+                    feature_utils=feature_utils,
+                    net=net,
+                    fm=fm,
+                    rng=rng,
+                    cfg_strength=cfg_strength
+                )
+
+            audio = audios.float().cpu()[0]
+
+            # Step 5: write final mp4
+            update_progress(job_id, 80)
+            output_file = JOB_DIR / f"{job_id}_output.mp4"
+            make_video(video_info, output_file, audio, sampling_rate=model_cfg.seq_cfg.sampling_rate)
+
+            update_progress(job_id, 100)
+            update_status(job_id, "done")
+
+        except Exception as e:
+            update_status(job_id, f"error: {e}")
+            log.exception(f"[JOB {job_id}] ERROR: {e}")
+
+        time.sleep(0.1)
+
 
 if __name__ == "__main__":
-    main()
+    worker_loop()
