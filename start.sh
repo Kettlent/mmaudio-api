@@ -34,23 +34,20 @@ sleep 1
 ### START WORKER (BACKGROUND)
 ### ----------------------------------------
 echo "[START] Launching worker.py in background..."
-nohup bash -c "source $CONDA_SH && conda activate $ENV_NAME && python3 $API_DIR/worker.py" \
-    > "$WORKER_LOG" 2>&1 &
+nohup python3 "$API_DIR/worker.py" > "$WORKER_LOG" 2>&1 &
 
 sleep 2
 
 WORKER_PID=$(pgrep -f "worker.py")
 echo "[OK] Worker started with PID: $WORKER_PID"
-echo "Logs: $WORKER_LOG"
+echo "Worker log: $WORKER_LOG"
 
 ### ----------------------------------------
-### START SERVER (FOREGROUND)
+### START SERVER (FOREGROUND, BLOCKING)
 ### ----------------------------------------
 echo "[START] Launching FastAPI server on port 8080..."
-echo "Logs: $SERVER_LOG"
+echo "Server log: $SERVER_LOG"
+echo "---------------------------------------------"
 
-exec bash -c "
-    source $CONDA_SH &&
-    conda activate $ENV_NAME &&
-    uvicorn server:app --host 0.0.0.0 --port 8080
-" | tee "$SERVER_LOG"
+# Run uvicorn in foreground without using pipes
+uvicorn server:app --host 0.0.0.0 --port 8080 | tee -a "$SERVER_LOG"
